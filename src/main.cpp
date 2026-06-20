@@ -24,9 +24,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_log.h>
+#include <esp_wifi.h>
 #include <stdint.h>
 #include <string.h>
 #include "gprintf.h"
+#include "soc/rtc_cntl_reg.h"
 
 // ============================================================================
 // Constants
@@ -49,6 +52,27 @@
 
 /** @brief Minimum acceptable received payload size. */
 #define MIN_PACKET_LEN            ((int32_t)sizeof(espnow_packet_t))
+
+/** @brief SSID of the master's soft-AP – used to discover its channel. */
+#define MASTER_AP_SSID            "ESP32-HomeMon"
+
+/** @brief Delay after WiFi.mode() before starting scan (ms). */
+#define WIFI_RADIO_SETTLE_MS      300U
+
+/** @brief Timeout waiting for the channel scan to complete (ms). */
+#define CHANNEL_SCAN_TIMEOUT_MS   10000U
+
+/** @brief Fallback ESP-NOW channel when master AP is not found in scan. */
+#define DEFAULT_ESPNOW_CHANNEL    1U
+
+/** @brief LED blink interval while scanning for master (ms). */
+#define LED_SCAN_BLINK_MS         1000U
+
+/** @brief LED blink interval once connected to a master peer (ms). */
+#define LED_CONN_BLINK_MS         250U
+
+/** @brief If no master contact within this window (ms), re-scan for its channel. */
+#define RESCAN_INTERVAL_MS      30000U
 
 // ============================================================================
 // Type definitions  (must stay byte-for-byte identical to the master's types)
@@ -111,9 +135,13 @@ typedef struct {
  * @brief Slave state-machine states.
  */
 typedef enum {
-    SLAVE_STATE_INIT,      /**< Initialise WiFi and ESP-NOW.                  */
-    SLAVE_STATE_LISTENING, /**< Operational: handle requests, update data.    */
-    SLAVE_STATE_ERROR,     /**< Unrecoverable error – retry after delay.      */
+    SLAVE_STATE_WIFI_INIT,    /**< Set WiFi STA mode; start radio-settle timer. */
+    SLAVE_STATE_CHANNEL_SCAN, /**< Start async scan for master soft-AP.         */
+    SLAVE_STATE_CHANNEL_WAIT, /**< Wait for scan; extract master channel.       */
+    SLAVE_STATE_ESPNOW_INIT,  /**< Initialise ESP-NOW on master's channel.      */
+    SLAVE_STATE_LISTENING,    /**< Operational: handle requests, update data.   */
+    SLAVE_STATE_RESCAN,       /**< No master seen; deinit ESP-NOW and re-scan.  */
+    SLAVE_STATE_ERROR,        /**< Unrecoverable error – retry after delay.     */
 } slave_state_t;
 
 // ============================================================================
@@ -130,10 +158,22 @@ static sensor_data_t sensorData;
 static uint32_t      sensorUpdateMs    = 0U;
 
 /** @brief Current slave state. */
-static slave_state_t slaveState        = SLAVE_STATE_INIT;
+static slave_state_t slaveState        = SLAVE_STATE_WIFI_INIT;
+
+/** @brief WiFi channel on which the master soft-AP was found. */
+static uint8_t       masterChannel     = DEFAULT_ESPNOW_CHANNEL;
 
 /** @brief millis() recorded when the current state was entered. */
 static uint32_t      stateTimestampMs  = 0U;
+
+/** @brief True once a master peer has been successfully registered. */
+static bool          masterConnected   = false;
+
+/** @brief millis() of the last onboard LED toggle. */
+static uint32_t      ledToggleMs       = 0U;
+
+/** @brief millis() when SLAVE_STATE_LISTENING was entered or master last seen. */
+static uint32_t      rescanTimerMs     = 0U;
 
 // ---------------------------------------------------------------------------
 // Receive queue – written by the ESP-NOW WiFi-task callback, read by loop().
@@ -165,6 +205,7 @@ static uint8_t      txTail = 0U;
 // Forward declarations
 // ============================================================================
 
+static void    updateLed          (void);
 static void    slaveProcess       (void);
 static void    processRxQueue     (void);
 static void    sendPending        (void);
@@ -237,7 +278,10 @@ static void onDataRecv(const uint8_t *srcMac,
 static void registerPeer(const uint8_t *macAddr)
 {
     if (esp_now_is_peer_exist(macAddr))
+    {
+        masterConnected = true;
         return;
+    }
 
     esp_now_peer_info_t peerInfo;
     memset(&peerInfo, 0, sizeof(peerInfo));
@@ -258,6 +302,7 @@ static void registerPeer(const uint8_t *macAddr)
         char macStr[18];
         macToString(macAddr, macStr);
         gprintf(gDBG, "[SLAVE] Registered master peer: %s\r\n", macStr);
+        masterConnected = true;
     }
 }
 
@@ -419,22 +464,19 @@ static void updateSensorData(void)
 // ============================================================================
 
 /**
- * @brief Initialises WiFi in station mode, starts ESP-NOW, and derives the
- *        slave's node ID from its MAC address.
+ * @brief Initialises ESP-NOW and derives the slave's node ID from its MAC.
  *
+ * WiFi mode and channel must already be configured before calling this.
  * The node ID is set to the least-significant byte of the device MAC,
- * guaranteeing uniqueness across all ESP32 slaves without configuration.
+ * guaranteeing uniqueness across all slaves without manual configuration.
  *
  * @return true on success, false if any ESP-NOW step failed.
  */
 static bool initEspNowSlave(void)
 {
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-
     uint8_t ownMac[MAC_ADDR_LEN];
     WiFi.macAddress(ownMac);
-    slaveNodeId = ownMac[MAC_ADDR_LEN - 1U]; /* last byte = unique-enough ID */
+    slaveNodeId = ownMac[MAC_ADDR_LEN - 1U];
 
     if (esp_now_init() != ESP_OK)
     {
@@ -447,8 +489,8 @@ static bool initEspNowSlave(void)
 
     char macStr[18];
     macToString(ownMac, macStr);
-    gprintf(gDBG, "[SLAVE] ESP-NOW ready. MAC=%s  NodeID=%u\r\n",
-            macStr, (uint32_t)slaveNodeId);
+    gprintf(gDBG, "[SLAVE] ESP-NOW ready on ch%u. MAC=%s  NodeID=%u\r\n",
+            (uint32_t)masterChannel, macStr, (uint32_t)slaveNodeId);
     return true;
 }
 
@@ -474,6 +516,27 @@ static void macToString(const uint8_t *mac, char *buf)
 }
 
 // ============================================================================
+// LED status indicator
+// ============================================================================
+
+/**
+ * @brief Toggles the onboard LED at a rate that reflects connection state.
+ *
+ * Blinks at LED_SCAN_BLINK_MS while no master peer is known, and switches to
+ * the faster LED_CONN_BLINK_MS cadence once the master has been registered.
+ */
+static void updateLed(void)
+{
+    uint32_t nowMs    = millis();
+    uint32_t interval = masterConnected ? LED_CONN_BLINK_MS : LED_SCAN_BLINK_MS;
+    if ((nowMs - ledToggleMs) >= interval)
+    {
+        ledToggleMs = nowMs;
+        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    }
+}
+
+// ============================================================================
 // Slave state machine
 // ============================================================================
 
@@ -481,11 +544,15 @@ static void macToString(const uint8_t *mac, char *buf)
  * @brief Non-blocking slave state machine; must be called from loop().
  *
  * State flow:
- *   INIT → LISTENING (normal)
- *   INIT → ERROR → INIT (on esp_now_init failure, retries after delay)
+ *   WIFI_INIT → CHANNEL_SCAN → CHANNEL_WAIT → ESPNOW_INIT → LISTENING
+ *                                                                 ↑         |
+ *                                                              RESCAN ←─────┘ (no master for RESCAN_INTERVAL_MS)
+ *   ESPNOW_INIT → ERROR → WIFI_INIT (on esp_now_init failure, retries after delay)
  *
  * LISTENING handles all work: draining the receive queue, sending queued
- * responses, and refreshing sensor data on a timer.
+ * responses, refreshing sensor data, and triggering a rescan when the master
+ * has not been seen for RESCAN_INTERVAL_MS (covers the case where the slave
+ * boots before the master and needs to rediscover the correct channel).
  */
 static void slaveProcess(void)
 {
@@ -494,14 +561,80 @@ static void slaveProcess(void)
     switch (slaveState)
     {
     /* ------------------------------------------------------------------ */
-    case SLAVE_STATE_INIT:
+    case SLAVE_STATE_WIFI_INIT:
+        WiFi.mode(WIFI_STA);
+        stateTimestampMs = nowMs;
+        slaveState       = SLAVE_STATE_CHANNEL_SCAN;
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case SLAVE_STATE_CHANNEL_SCAN:
+        if ((nowMs - stateTimestampMs) >= WIFI_RADIO_SETTLE_MS)
+        {
+            gprintf(gDBG, "[SLAVE] Scanning for master AP \"%s\"...\r\n",
+                    MASTER_AP_SSID);
+            WiFi.scanNetworks(/* async= */ true);
+            stateTimestampMs = nowMs;
+            slaveState       = SLAVE_STATE_CHANNEL_WAIT;
+        }
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case SLAVE_STATE_CHANNEL_WAIT:
+    {
+        int16_t scanResult = (int16_t)WiFi.scanComplete();
+        if (scanResult == (int16_t)WIFI_SCAN_RUNNING)
+        {
+            if ((nowMs - stateTimestampMs) >= CHANNEL_SCAN_TIMEOUT_MS)
+            {
+                gprintf(gDBG, "[SLAVE] Scan timed out – using ch%u\r\n",
+                        (uint32_t)DEFAULT_ESPNOW_CHANNEL);
+                WiFi.scanDelete();
+                masterChannel = DEFAULT_ESPNOW_CHANNEL;
+                esp_wifi_set_channel(masterChannel, WIFI_SECOND_CHAN_NONE);
+                slaveState = SLAVE_STATE_ESPNOW_INIT;
+            }
+        }
+        else
+        {
+            if (scanResult > 0)
+            {
+                uint8_t netCount = (uint8_t)scanResult;
+                for (uint8_t i = 0U; i < netCount; i++)
+                {
+                    /* WiFi.SSID() returns String – .c_str() extracts raw ptr */
+                    if (strcmp(WiFi.SSID(i).c_str(), MASTER_AP_SSID) == 0)
+                    {
+                        masterChannel = (uint8_t)WiFi.channel(i);
+                        gprintf(gDBG, "[SLAVE] Master AP found on ch%u\r\n",
+                                (uint32_t)masterChannel);
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                gprintf(gDBG, "[SLAVE] Master AP not found – using ch%u\r\n",
+                        (uint32_t)DEFAULT_ESPNOW_CHANNEL);
+                masterChannel = DEFAULT_ESPNOW_CHANNEL;
+            }
+            WiFi.scanDelete();
+            esp_wifi_set_channel(masterChannel, WIFI_SECOND_CHAN_NONE);
+            slaveState = SLAVE_STATE_ESPNOW_INIT;
+        }
+        break;
+    }
+
+    /* ------------------------------------------------------------------ */
+    case SLAVE_STATE_ESPNOW_INIT:
         memset(&sensorData, 0, sizeof(sensorData));
         sensorUpdateMs   = nowMs;
         stateTimestampMs = nowMs;
 
         if (initEspNowSlave())
         {
-            slaveState = SLAVE_STATE_LISTENING;
+            rescanTimerMs = nowMs;
+            slaveState    = SLAVE_STATE_LISTENING;
         }
         else
         {
@@ -514,20 +647,41 @@ static void slaveProcess(void)
         updateSensorData();
         processRxQueue();
         sendPending();
+        if (masterConnected)
+        {
+            rescanTimerMs = nowMs; /* keep timer from expiring while connected */
+        }
+        else if ((nowMs - rescanTimerMs) >= RESCAN_INTERVAL_MS)
+        {
+            gprintf(gDBG, "[SLAVE] No master contact for %us – re-scanning\r\n",
+                    (uint32_t)(RESCAN_INTERVAL_MS / 1000U));
+            slaveState = SLAVE_STATE_RESCAN;
+        }
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case SLAVE_STATE_RESCAN:
+        esp_now_deinit();
+        masterConnected = false;
+        rxHead          = 0U;
+        rxTail          = 0U;
+        txHead          = 0U;
+        txTail          = 0U;
+        slaveState      = SLAVE_STATE_WIFI_INIT;
         break;
 
     /* ------------------------------------------------------------------ */
     case SLAVE_STATE_ERROR:
         if ((nowMs - stateTimestampMs) >= INIT_RETRY_DELAY_MS)
         {
-            gprintf(gDBG, "[SLAVE] Retrying initialisation...\r\n");
-            slaveState = SLAVE_STATE_INIT;
+            gprintf(gDBG, "[SLAVE] Retrying...\r\n");
+            slaveState = SLAVE_STATE_WIFI_INIT;
         }
         break;
 
     /* ------------------------------------------------------------------ */
     default:
-        slaveState = SLAVE_STATE_INIT;
+        slaveState = SLAVE_STATE_WIFI_INIT;
         break;
     }
 }
@@ -544,7 +698,11 @@ static void slaveProcess(void)
  */
 void setup(void)
 {
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); /* disable brownout on weak PSU */
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);
     initUartBaud(gDBG, 115200U);
+    esp_log_level_set("*", ESP_LOG_NONE);       /* suppress ESP-IDF radio logs */
     clear_screen(gDBG);
     gprintf(gDBG, "\r\n========================================\r\n");
     gprintf(gDBG, "  ESP-NOW Slave Node  v1.0\r\n");
@@ -557,6 +715,7 @@ void setup(void)
  */
 void loop(void)
 {
+    updateLed();
     slaveProcess();
 }
 
