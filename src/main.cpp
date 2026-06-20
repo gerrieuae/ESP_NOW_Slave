@@ -201,6 +201,9 @@ static uint8_t      txHead = 0U;
 /** @brief Read index for txQueue. */
 static uint8_t      txTail = 0U;
 
+/** @brief millis() before which the TX queue is held (collision-avoidance backoff). */
+static uint32_t     txHoldUntilMs = 0U;
+
 // ============================================================================
 // Forward declarations
 // ============================================================================
@@ -361,6 +364,13 @@ static void enqueueTx(const uint8_t *destMac, pkt_type_t pktType)
     memcpy(txQueue[txHead].destMac, destMac, MAC_ADDR_LEN);
     txQueue[txHead].pktType = pktType;
     txHead = nextHead;
+
+    /* DISCOVER_RESP: random 0-199 ms backoff so multiple slaves that hear the
+     * same broadcast don't transmit simultaneously (hidden-node collision). */
+    if (pktType == PKT_DISCOVER_RESP)
+    {
+        txHoldUntilMs = millis() + (esp_random() % 200U);
+    }
 }
 
 /**
@@ -368,6 +378,9 @@ static void enqueueTx(const uint8_t *destMac, pkt_type_t pktType)
  */
 static void sendPending(void)
 {
+    if (millis() < txHoldUntilMs)
+        return;
+
     while (txTail != txHead)
     {
         sendPacket(txQueue[txTail].destMac, txQueue[txTail].pktType);
